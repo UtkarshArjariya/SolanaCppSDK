@@ -7,8 +7,6 @@ class Base58 {
 public:
   static std::string encode(const std::vector<unsigned char> &input);
   static std::vector<unsigned char> decode(const std::string &input);
-  static std::string encodeString(const std::string &input);
-  static std::string decodeString(const std::string &input);
 private:
   static const char *const ALPHABET;
   static const signed char ALPHABET_MAP[128];
