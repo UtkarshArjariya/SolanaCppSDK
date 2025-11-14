@@ -40,3 +40,14 @@ std::vector<unsigned char> Base58::decode(const std::string &input) {
   return decoded;
 }
 } // namespace solana
+
+// Convenience string variants
+namespace solana {
+std::string Base58::encodeString(const std::string &input) {
+  return encode({input.begin(), input.end()});
+}
+std::string Base58::decodeString(const std::string &input) {
+  auto vec = decode(input);
+  return {vec.begin(), vec.end()};
+}
+} // namespace solana
