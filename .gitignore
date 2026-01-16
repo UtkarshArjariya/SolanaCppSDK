@@ -6,7 +6,3 @@ build/
 .DS_Store
 .vscode/
 cmake-build-*/
-vcpkg/
-*.exe
-status_out.txt
-vcpkg_ls.txt
