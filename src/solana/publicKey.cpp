@@ -1,5 +1,5 @@
-#include <solana/publicKey.h>
-#include <solana/base58.h>
+#include "solana/publicKey.h"
+#include "solana/base58.h"
 #include <stdexcept>
 #include <cstring>
 #include <sodium.h>
@@ -55,45 +55,6 @@ namespace solana
   {
     static uint64_t counter = 1;
     return PublicKey(counter++);
-  }
-
-  PublicKey PublicKey::createWithSeed(
-      const PublicKey &fromPublicKey,
-      const std::string &seed,
-      const PublicKey &programId)
-  {
-    // TODO: implement SHA256(fromPublicKey || seed || programId)
-    return PublicKey(std::array<uint8_t, PUBLIC_KEY_LENGTH>{});
-  }
-
-  PublicKey PublicKey::createProgramAddressSync(
-      const std::vector<std::vector<uint8_t>> &seeds,
-      const PublicKey &programId)
-  {
-    // TODO: implement (validate seeds, SHA256, isOnCurve check)
-    return PublicKey(std::array<uint8_t, PUBLIC_KEY_LENGTH>{});
-  }
-
-  PublicKey PublicKey::createProgramAddress(
-      const std::vector<std::vector<uint8_t>> &seeds,
-      const PublicKey &programId)
-  {
-    return createProgramAddressSync(seeds, programId);
-  }
-
-  std::pair<PublicKey, uint8_t> PublicKey::findProgramAddressSync(
-      const std::vector<std::vector<uint8_t>> &seeds,
-      const PublicKey &programId)
-  {
-    // TODO: implement bump seed search (255..0)
-    return {PublicKey(std::array<uint8_t, PUBLIC_KEY_LENGTH>{}), 255};
-  }
-
-  std::pair<PublicKey, uint8_t> PublicKey::findProgramAddress(
-      const std::vector<std::vector<uint8_t>> &seeds,
-      const PublicKey &programId)
-  {
-    return findProgramAddressSync(seeds, programId);
   }
 
   bool PublicKey::isOnCurve(const PublicKey &key)
