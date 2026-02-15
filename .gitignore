@@ -3,10 +3,6 @@ build/
 *.a
 *.so
 *.dll
-*.exe
 .DS_Store
 .vscode/
 cmake-build-*/
-vcpkg/
-*.txt.user
-libsodium-26.dll
