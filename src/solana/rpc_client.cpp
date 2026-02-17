@@ -1,9 +1,11 @@
 #include "solana/rpc_client.h"
 #include "solana/base58.h"
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 // POSIX socket headers
 #include <arpa/inet.h>
@@ -11,14 +13,31 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// OpenSSL for TLS (compile with -lssl -lcrypto)
+#ifdef SOLANA_SDK_NO_TLS
+// TLS disabled at build time
+#else
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
+
 namespace solana {
 
-// ── Constructor / endpoint parsing ──────────────────────────────────────────
+// ── Constructors ────────────────────────────────────────────────────────────
 
 RpcClient::RpcClient(const std::string &endpoint)
     : _endpoint(endpoint), _port(80), _tls(false) {
   parseEndpoint();
 }
+
+RpcClient::RpcClient(const std::string &endpoint, const ProxyConfig &proxy)
+    : _endpoint(endpoint), _port(80), _tls(false), _proxy(proxy) {
+  parseEndpoint();
+}
+
+void RpcClient::setProxy(const ProxyConfig &proxy) { _proxy = proxy; }
+
+// ── Endpoint parsing ────────────────────────────────────────────────────────
 
 void RpcClient::parseEndpoint() {
   std::string url = _endpoint;
@@ -43,20 +62,17 @@ void RpcClient::parseEndpoint() {
   }
 }
 
-// ── Low-level HTTP POST ──────────────────────────────────────────────────────
+// ── Low-level HTTP POST (plain TCP) ─────────────────────────────────────────
 
-std::string RpcClient::rpcPost(const std::string &body) {
-  if (_tls)
-    throw std::runtime_error("TLS not supported in embedded mode. Use an HTTP "
-                             "endpoint or a TLS proxy.");
-
-  // Resolve host
+std::string RpcClient::httpPost(const std::string &host, int port,
+                                const std::string &path,
+                                const std::string &body) {
   struct addrinfo hints{}, *res = nullptr;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_family = AF_UNSPEC;
-  std::string portStr = std::to_string(_port);
-  if (getaddrinfo(_host.c_str(), portStr.c_str(), &hints, &res) != 0)
-    throw std::runtime_error("DNS resolution failed for: " + _host);
+  std::string portStr = std::to_string(port);
+  if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0)
+    throw std::runtime_error("DNS resolution failed for: " + host);
 
   int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
   if (fd < 0) {
@@ -67,14 +83,14 @@ std::string RpcClient::rpcPost(const std::string &body) {
   if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
     ::close(fd);
     freeaddrinfo(res);
-    throw std::runtime_error("connect() failed to " + _host + ":" + portStr);
+    throw std::runtime_error("connect() failed to " + host + ":" + portStr);
   }
   freeaddrinfo(res);
 
   // Build HTTP/1.1 request
   std::ostringstream req;
-  req << "POST " << _path << " HTTP/1.1\r\n"
-      << "Host: " << _host << "\r\n"
+  req << "POST " << path << " HTTP/1.1\r\n"
+      << "Host: " << host << "\r\n"
       << "Content-Type: application/json\r\n"
       << "Content-Length: " << body.size() << "\r\n"
       << "Connection: close\r\n"
@@ -82,7 +98,6 @@ std::string RpcClient::rpcPost(const std::string &body) {
       << body;
   std::string reqStr = req.str();
 
-  // Send
   const char *ptr = reqStr.c_str();
   size_t rem = reqStr.size();
   while (rem > 0) {
@@ -95,7 +110,6 @@ std::string RpcClient::rpcPost(const std::string &body) {
     rem -= sent;
   }
 
-  // Receive
   std::string response;
   char buf[4096];
   ssize_t n;
@@ -103,15 +117,129 @@ std::string RpcClient::rpcPost(const std::string &body) {
     response.append(buf, n);
   ::close(fd);
 
-  // Strip HTTP headers (find \r\n\r\n)
   auto sep = response.find("\r\n\r\n");
   if (sep == std::string::npos)
     throw std::runtime_error("Malformed HTTP response");
   return response.substr(sep + 4);
 }
 
-// ── JSON extraction helper ──────────────────────────────────────────────────
-// Very simple, purpose-built parser; avoids heavy JSON library dependency.
+// ── HTTPS POST (OpenSSL) ────────────────────────────────────────────────────
+
+std::string RpcClient::httpsPost(const std::string &host, int port,
+                                 const std::string &path,
+                                 const std::string &body) {
+#ifdef SOLANA_SDK_NO_TLS
+  throw std::runtime_error(
+      "TLS support disabled at build time (SOLANA_SDK_NO_TLS). "
+      "Use an HTTP proxy or rebuild with OpenSSL.");
+#else
+  // Initialize OpenSSL
+  SSL_library_init();
+  SSL_load_error_strings();
+  OpenSSL_add_all_algorithms();
+
+  const SSL_METHOD *method = TLS_client_method();
+  SSL_CTX *ctx = SSL_CTX_new(method);
+  if (!ctx)
+    throw std::runtime_error("SSL_CTX_new failed");
+
+  // Load system CA certificates
+  SSL_CTX_set_default_verify_paths(ctx);
+
+  // Resolve and connect TCP
+  struct addrinfo hints{}, *res = nullptr;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  std::string portStr = std::to_string(port);
+  if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0) {
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("DNS resolution failed for: " + host);
+  }
+
+  int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (fd < 0) {
+    freeaddrinfo(res);
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("socket() failed");
+  }
+
+  if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    ::close(fd);
+    freeaddrinfo(res);
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("connect() failed to " + host + ":" + portStr);
+  }
+  freeaddrinfo(res);
+
+  // SSL handshake
+  SSL *ssl = SSL_new(ctx);
+  SSL_set_fd(ssl, fd);
+  SSL_set_tlsext_host_name(ssl, host.c_str()); // SNI
+  if (SSL_connect(ssl) <= 0) {
+    SSL_free(ssl);
+    ::close(fd);
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("SSL handshake failed with " + host);
+  }
+
+  // Build HTTP request
+  std::ostringstream req;
+  req << "POST " << path << " HTTP/1.1\r\n"
+      << "Host: " << host << "\r\n"
+      << "Content-Type: application/json\r\n"
+      << "Content-Length: " << body.size() << "\r\n"
+      << "Connection: close\r\n"
+      << "\r\n"
+      << body;
+  std::string reqStr = req.str();
+
+  // Send over SSL
+  int written = SSL_write(ssl, reqStr.c_str(), reqStr.size());
+  if (written <= 0) {
+    SSL_free(ssl);
+    ::close(fd);
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("SSL_write failed");
+  }
+
+  // Receive over SSL
+  std::string response;
+  char buf[4096];
+  int bytesRead;
+  while ((bytesRead = SSL_read(ssl, buf, sizeof(buf))) > 0)
+    response.append(buf, bytesRead);
+
+  SSL_shutdown(ssl);
+  SSL_free(ssl);
+  ::close(fd);
+  SSL_CTX_free(ctx);
+
+  // Strip HTTP headers
+  auto sep = response.find("\r\n\r\n");
+  if (sep == std::string::npos)
+    throw std::runtime_error("Malformed HTTPS response");
+  return response.substr(sep + 4);
+#endif
+}
+
+// ── RPC POST dispatcher ────────────────────────────────────────────────────
+
+std::string RpcClient::rpcPost(const std::string &body) {
+  // If proxy is enabled, send all traffic (including HTTPS targets) through
+  // the HTTP proxy
+  if (_proxy.enabled) {
+    return httpPost(_proxy.host, _proxy.port, _path, body);
+  }
+
+  if (_tls) {
+    return httpsPost(_host, _port, _path, body);
+  } else {
+    return httpPost(_host, _port, _path, body);
+  }
+}
+
+// ── JSON extraction helpers ─────────────────────────────────────────────────
+// Simple purpose-built parser to avoid heavy JSON library dependency.
 
 static std::string extractJsonString(const std::string &json,
                                      const std::string &key) {
@@ -140,6 +268,13 @@ static uint64_t extractJsonNumber(const std::string &json,
   return std::stoull(json.substr(pos));
 }
 
+// Check if a JSON response contains a non-null "result" that is not an error
+static bool hasConfirmation(const std::string &json) {
+  // Look for "confirmationStatus":"finalized" or "confirmed" or "processed"
+  auto cs = extractJsonString(json, "confirmationStatus");
+  return cs == "finalized" || cs == "confirmed" || cs == "processed";
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 std::string RpcClient::getLatestBlockhash() {
@@ -159,10 +294,8 @@ std::string RpcClient::sendTransaction(const std::string &base64Tx) {
       base64Tx +
       R"(", {"encoding":"base64","preflightCommitment":"processed"}]})";
   std::string resp = rpcPost(body);
-  // Result is the tx signature string
   std::string sig = extractJsonString(resp, "result");
   if (sig.empty()) {
-    // Check for error
     std::string err = extractJsonString(resp, "message");
     throw std::runtime_error("sendTransaction failed: " +
                              (err.empty() ? resp : err));
@@ -183,6 +316,67 @@ std::string RpcClient::getAccountInfo(const PublicKey &pubkey) {
       R"({"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[")" +
       pubkey.toBase58() + R"(", {"encoding":"base64"}]})";
   return rpcPost(body);
+}
+
+std::string RpcClient::requestAirdrop(const PublicKey &pubkey,
+                                      uint64_t lamports) {
+  std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"requestAirdrop","params":[")" +
+      pubkey.toBase58() + R"(", )" + std::to_string(lamports) + R"(]})";
+  std::string resp = rpcPost(body);
+  std::string sig = extractJsonString(resp, "result");
+  if (sig.empty()) {
+    std::string err = extractJsonString(resp, "message");
+    throw std::runtime_error("requestAirdrop failed: " +
+                             (err.empty() ? resp : err));
+  }
+  return sig;
+}
+
+bool RpcClient::confirmTransaction(const std::string &signature,
+                                   uint32_t timeoutMs) {
+  auto start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    if (elapsed >= timeoutMs)
+      return false;
+
+    try {
+      std::string resp = getSignatureStatuses({signature});
+      if (hasConfirmation(resp))
+        return true;
+    } catch (...) {
+      // Ignore transient errors, keep polling
+    }
+
+    // Poll every 2 seconds
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+  }
+}
+
+std::string
+RpcClient::getSignatureStatuses(const std::vector<std::string> &signatures) {
+  std::ostringstream sigs;
+  sigs << "[";
+  for (size_t i = 0; i < signatures.size(); ++i) {
+    if (i > 0)
+      sigs << ",";
+    sigs << "\"" << signatures[i] << "\"";
+  }
+  sigs << "]";
+
+  std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[)" +
+      sigs.str() + R"(, {"searchTransactionHistory":true}]})";
+  return rpcPost(body);
+}
+
+uint64_t RpcClient::getSlot() {
+  std::string body = R"({"jsonrpc":"2.0","id":1,"method":"getSlot"})";
+  std::string resp = rpcPost(body);
+  return extractJsonNumber(resp, "result");
 }
 
 } // namespace solana
