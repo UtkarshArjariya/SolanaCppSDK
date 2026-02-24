@@ -1,6 +1,6 @@
 # Solana C++ SDK
 
-[![Build Status](https://github.com/solana-turbin3/solanacppsdk/actions/workflows/cmake.yml/badge.svg)](https://github.com/solana-turbin3/solanacppsdk/actions/workflows/cmake.yml)
+[![Build Status](https://github.com/utkarsharjariya/solanacppsdk/actions/workflows/cmake.yml/badge.svg)](https://github.com/utkarsharjariya/solanacppsdk/actions/workflows/cmake.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A lightweight C++ SDK for interacting with the Solana blockchain. Designed to work on both desktop systems and embedded/microcontroller platforms (ESP32, STM32, etc.).
