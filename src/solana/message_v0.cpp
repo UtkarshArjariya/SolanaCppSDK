@@ -64,28 +64,6 @@ MessageV0 MessageV0::compile(
     // Fee payer: first signer, writable
     findOrAddStatic(feePayer, true, true);
 
-    // Helper: is a key a signer in any instruction?
-    // Pre-compute the set of signing pubkeys
-    std::vector<PublicKey> signerSet;
-    signerSet.push_back(feePayer);
-    for (auto &instr : instructions) {
-        for (auto &am : instr.accounts) {
-            if (am.isSigner) {
-                bool found = false;
-                for (auto &s : signerSet)
-                    if (s.equals(am.pubkey)) { found = true; break; }
-                if (!found)
-                    signerSet.push_back(am.pubkey);
-            }
-        }
-    }
-
-    auto isSignerKey = [&](const PublicKey &pk) -> bool {
-        for (auto &s : signerSet)
-            if (s.equals(pk)) return true;
-        return false;
-    };
-
     // Helper: search lookup tables for a pubkey (non-signer only)
     // Returns {tableIndex, addressIndex, isWritable} or {-1,...} if not found
     struct LookupRef { int tableIdx; uint8_t addrIdx; bool isWritable; };

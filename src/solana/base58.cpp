@@ -22,6 +22,7 @@ std::string Base58::encode(const std::vector<unsigned char> &input) {
   }
   std::string result;
   for(size_t i=0;i<input.size()&&input[i]==0;i++) result.push_back('1');
+  while(digitslen>0&&digits[digitslen-1]==0) --digitslen;
   for(int i=digitslen-1;i>=0;i--) result.push_back(ALPHABET[digits[i]]);
   return result;
 }
@@ -35,6 +36,8 @@ std::vector<unsigned char> Base58::decode(const std::string &input) {
     while(carry>0){result.push_back((unsigned char)(carry&0xff));carry>>=8;}
   }
   int lz=0;for(char c:input){if(c=='1')lz++;else break;}
+  // Strip high-order zeros from the little-endian result (avoid extra zero for value 0)
+  while(!result.empty()&&result.back()==0) result.pop_back();
   std::vector<unsigned char> decoded(lz,0);
   for(int i=result.size()-1;i>=0;i--) decoded.push_back(result[i]);
   return decoded;
