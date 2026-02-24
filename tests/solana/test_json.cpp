@@ -14,62 +14,66 @@
 
 using namespace solana;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-static void fail(const char *msg) {
-    std::cerr << "  FAIL: " << msg << "\n";
-    std::exit(1);
-}
-
 // ── Basic type parsing ────────────────────────────────────────────────────────
+// NOTE: JsonValue is zero-copy — the source string must outlive the JsonValue.
+// Always store JSON in a named variable before parsing.
 
 void test_null() {
-    auto v = json::JsonValue::parse("null");
+    std::string src = "null";
+    auto v = json::JsonValue::parse(src);
     assert(v.isNull());
     std::cout << "  PASS: null\n";
 }
 
 void test_booleans() {
-    auto t = json::JsonValue::parse("true");
-    auto f = json::JsonValue::parse("false");
+    std::string st = "true", sf = "false";
+    auto t = json::JsonValue::parse(st);
+    auto f = json::JsonValue::parse(sf);
     assert(t.isBool() && t.asBool() == true);
     assert(f.isBool() && f.asBool() == false);
     std::cout << "  PASS: booleans\n";
 }
 
 void test_numbers() {
-    auto iv = json::JsonValue::parse("42");
+    std::string s1 = "42";
+    auto iv = json::JsonValue::parse(s1);
     assert(iv.isNumber());
     assert(iv.asInt() == 42);
     assert(iv.asUint() == 42u);
 
-    auto neg = json::JsonValue::parse("-7");
+    std::string s2 = "-7";
+    auto neg = json::JsonValue::parse(s2);
     assert(neg.asInt() == -7);
 
-    auto zero = json::JsonValue::parse("0");
+    std::string s3 = "0";
+    auto zero = json::JsonValue::parse(s3);
     assert(zero.asUint() == 0u);
 
     // Large uint64
-    auto big = json::JsonValue::parse("9999999999999");
+    std::string s4 = "9999999999999";
+    auto big = json::JsonValue::parse(s4);
     assert(big.asUint() == 9999999999999ULL);
 
     std::cout << "  PASS: numbers\n";
 }
 
 void test_strings() {
-    auto s = json::JsonValue::parse(R"("hello world")");
+    std::string src1 = R"("hello world")";
+    auto s = json::JsonValue::parse(src1);
     assert(s.isString());
     assert(s.asString() == "hello world");
 
     // Escape sequences
-    auto esc = json::JsonValue::parse(R"("line1\nline2\ttab")");
+    std::string src2 = R"("line1\nline2\ttab")";
+    auto esc = json::JsonValue::parse(src2);
     assert(esc.asString() == "line1\nline2\ttab");
 
     std::cout << "  PASS: strings\n";
 }
 
 void test_array() {
-    auto arr = json::JsonValue::parse(R"([1, 2, 3])");
+    std::string src = R"([1, 2, 3])";
+    auto arr = json::JsonValue::parse(src);
     assert(arr.isArray());
     assert(arr.arraySize() == 3);
     assert(arr[size_t(0)].asInt() == 1);
@@ -83,7 +87,8 @@ void test_array() {
 }
 
 void test_object() {
-    auto obj = json::JsonValue::parse(R"({"key":"val","num":100})");
+    std::string src = R"({"key":"val","num":100})";
+    auto obj = json::JsonValue::parse(src);
     assert(obj.isObject());
     assert(obj["key"].asString() == "val");
     assert(obj["num"].asInt() == 100);

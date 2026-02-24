@@ -130,6 +130,7 @@ std::string RpcClient::httpsPost(const std::string &host, int port,
                                  const std::string &path,
                                  const std::string &body) {
 #ifdef SOLANA_SDK_NO_TLS
+  (void)host; (void)port; (void)path; (void)body;
   throw std::runtime_error(
       "TLS support disabled at build time (SOLANA_SDK_NO_TLS). "
       "Use an HTTP proxy or rebuild with OpenSSL.");
