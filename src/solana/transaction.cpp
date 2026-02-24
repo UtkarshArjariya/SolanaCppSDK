@@ -1,4 +1,5 @@
 #include "solana/transaction.h"
+#include "solana/message_v0.h"
 #include <cstring>
 #include <sodium.h>
 #include <stdexcept>
@@ -80,6 +81,66 @@ std::string Transaction::toBase64() const { return base64Encode(serialize()); }
 const std::vector<std::array<uint8_t, SIGNATURE_LENGTH>> &
 Transaction::signatures() const {
   return _signatures;
+}
+
+// ── TransactionV0 ────────────────────────────────────────────────────────────
+
+TransactionV0::TransactionV0(const MessageV0 &message) : _message(message) {
+    size_t numSigs = message.numRequiredSignatures();
+    _signatures.assign(numSigs, std::array<uint8_t, SIGNATURE_LENGTH>{});
+}
+
+void TransactionV0::sign(const std::vector<Keypair> &signers) {
+    if (signers.empty())
+        throw std::runtime_error("TransactionV0: no signers provided");
+
+    // Sign the raw message bytes (no version prefix — signers sign the message body)
+    auto msgBytes = _message.serialize();
+
+    auto &keys = _message.staticAccountKeys();
+    for (auto &kp : signers) {
+        PublicKey pk = kp.publicKey();
+        for (size_t i = 0; i < keys.size() && i < _signatures.size(); ++i) {
+            if (keys[i].equals(pk)) {
+                _signatures[i] = kp.sign(msgBytes);
+                break;
+            }
+        }
+    }
+}
+
+std::vector<uint8_t> TransactionV0::serialize() const {
+    std::vector<uint8_t> buf;
+
+    // compact-u16 signature count
+    uint16_t sigCount = static_cast<uint16_t>(_signatures.size());
+    uint8_t b = sigCount & 0x7F;
+    sigCount >>= 7;
+    if (sigCount > 0)
+        b |= 0x80;
+    buf.push_back(b);
+    if (sigCount > 0)
+        buf.push_back(static_cast<uint8_t>(sigCount));
+
+    // Each signature: 64 bytes
+    for (auto &sig : _signatures)
+        buf.insert(buf.end(), sig.begin(), sig.end());
+
+    // Version prefix byte: 0x80 marks V0
+    buf.push_back(0x80);
+
+    // Serialized V0 message body
+    auto msgBytes = _message.serialize();
+    buf.insert(buf.end(), msgBytes.begin(), msgBytes.end());
+
+    return buf;
+}
+
+std::string TransactionV0::toBase64() const { return base64Encode(serialize()); }
+
+const std::vector<std::array<uint8_t, SIGNATURE_LENGTH>> &
+TransactionV0::signatures() const {
+    return _signatures;
 }
 
 } // namespace solana

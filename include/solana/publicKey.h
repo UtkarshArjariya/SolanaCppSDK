@@ -21,6 +21,28 @@ public:
   static PublicKey unique();
   static bool isOnCurve(const PublicKey &key);
   static const PublicKey Default;
+
+  // ── PDA Derivation ──────────────────────────────────────────────────────
+
+  static PublicKey createWithSeed(const PublicKey &fromPublicKey,
+                                  const std::string &seed,
+                                  const PublicKey &programId);
+
+  static PublicKey createProgramAddressSync(
+      const std::vector<std::vector<uint8_t>> &seeds,
+      const PublicKey &programId);
+
+  static PublicKey createProgramAddress(
+      const std::vector<std::vector<uint8_t>> &seeds,
+      const PublicKey &programId);
+
+  static std::pair<PublicKey, uint8_t> findProgramAddressSync(
+      const std::vector<std::vector<uint8_t>> &seeds,
+      const PublicKey &programId);
+
+  static std::pair<PublicKey, uint8_t> findProgramAddress(
+      const std::vector<std::vector<uint8_t>> &seeds,
+      const PublicKey &programId);
 private:
   std::array<uint8_t,PUBLIC_KEY_LENGTH> _bytes;
 };
