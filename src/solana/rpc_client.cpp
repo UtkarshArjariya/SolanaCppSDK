@@ -1,5 +1,6 @@
 #include "solana/rpc_client.h"
 #include "solana/base58.h"
+#include "solana/json.h"
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -129,6 +130,7 @@ std::string RpcClient::httpsPost(const std::string &host, int port,
                                  const std::string &path,
                                  const std::string &body) {
 #ifdef SOLANA_SDK_NO_TLS
+  (void)host; (void)port; (void)path; (void)body;
   throw std::runtime_error(
       "TLS support disabled at build time (SOLANA_SDK_NO_TLS). "
       "Use an HTTP proxy or rebuild with OpenSSL.");
@@ -222,161 +224,233 @@ std::string RpcClient::httpsPost(const std::string &host, int port,
 #endif
 }
 
-// ── RPC POST dispatcher ────────────────────────────────────────────────────
+// ── RPC POST dispatcher ─────────────────────────────────────────────────────
 
 std::string RpcClient::rpcPost(const std::string &body) {
-  // If proxy is enabled, send all traffic (including HTTPS targets) through
-  // the HTTP proxy
-  if (_proxy.enabled) {
-    return httpPost(_proxy.host, _proxy.port, _path, body);
-  }
-
-  if (_tls) {
-    return httpsPost(_host, _port, _path, body);
-  } else {
+    if (_proxy.enabled)
+        return httpPost(_proxy.host, _proxy.port, _path, body);
+    if (_tls)
+        return httpsPost(_host, _port, _path, body);
     return httpPost(_host, _port, _path, body);
-  }
 }
 
-// ── JSON extraction helpers ─────────────────────────────────────────────────
-// Simple purpose-built parser to avoid heavy JSON library dependency.
+// ── Internal helpers ──────────────────────────────────────────────────────────
+// Uses the bundled solana::json parser — handles nested objects, null checks,
+// and arrays robustly without string-search fragility.
 
-static std::string extractJsonString(const std::string &json,
-                                     const std::string &key) {
-  auto pos = json.find("\"" + key + "\"");
-  if (pos == std::string::npos)
-    return "";
-  pos = json.find("\"", pos + key.size() + 2);
-  if (pos == std::string::npos)
-    return "";
-  auto end = json.find("\"", pos + 1);
-  if (end == std::string::npos)
-    return "";
-  return json.substr(pos + 1, end - pos - 1);
+/// Base64-decode helper for account data returned by RPC
+static std::vector<uint8_t> base64DecodeRpc(const std::string &in) {
+    static const int8_t T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    };
+    std::vector<uint8_t> out;
+    out.reserve((in.size() * 3) / 4);
+    int val = 0, valb = -8;
+    for (uint8_t c : in) {
+        int8_t t = T[c];
+        if (t == -1) break;
+        val = (val << 6) + t;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
 }
 
-static uint64_t extractJsonNumber(const std::string &json,
-                                  const std::string &key) {
-  auto pos = json.find("\"" + key + "\"");
-  if (pos == std::string::npos)
-    return 0;
-  pos = json.find(":", pos);
-  if (pos == std::string::npos)
-    return 0;
-  while (pos < json.size() && !isdigit(json[pos]))
-    ++pos;
-  return std::stoull(json.substr(pos));
+// Parse an AccountInfo object from a JSON value node.
+// node should be the "value" field from getAccountInfo / getMultipleAccounts.
+static AccountInfo parseAccountInfoNode(const json::JsonValue &node) {
+    AccountInfo info;
+    if (node.isNull()) return info;
+    info.exists     = true;
+    info.lamports   = node["lamports"].asUint();
+    info.owner      = node["owner"].asString();
+    info.executable = node["executable"].asBool();
+    info.rentEpoch  = node["rentEpoch"].asUint();
+    // data field is ["<base64 string>", "base64"]
+    auto dataArr = node["data"];
+    if (dataArr.isArray() && dataArr.arraySize() >= 1)
+        info.data = base64DecodeRpc(dataArr[size_t(0)].asString());
+    return info;
 }
 
-// Check if a JSON response contains a non-null "result" that is not an error
-static bool hasConfirmation(const std::string &json) {
-  // Look for "confirmationStatus":"finalized" or "confirmed" or "processed"
-  auto cs = extractJsonString(json, "confirmationStatus");
-  return cs == "finalized" || cs == "confirmed" || cs == "processed";
-}
-
-// ── Public API ──────────────────────────────────────────────────────────────
+// ── Public RPC API ────────────────────────────────────────────────────────────
 
 std::string RpcClient::getLatestBlockhash() {
-  std::string body =
-      R"({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"finalized"}]})";
-  std::string resp = rpcPost(body);
-  std::string bh = extractJsonString(resp, "blockhash");
-  if (bh.empty())
-    throw std::runtime_error("Could not parse blockhash from response:\n" +
-                             resp);
-  return bh;
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"finalized"}]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    auto bh = root["result"]["value"]["blockhash"].asString();
+    if (bh.empty()) {
+        auto errMsg = root["error"]["message"].asString();
+        throw std::runtime_error("getLatestBlockhash failed: " +
+                                 (errMsg.empty() ? resp : errMsg));
+    }
+    return bh;
 }
 
 std::string RpcClient::sendTransaction(const std::string &base64Tx) {
-  std::string body =
-      R"({"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[")" +
-      base64Tx +
-      R"(", {"encoding":"base64","preflightCommitment":"processed"}]})";
-  std::string resp = rpcPost(body);
-  std::string sig = extractJsonString(resp, "result");
-  if (sig.empty()) {
-    std::string err = extractJsonString(resp, "message");
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[")" +
+        base64Tx +
+        R"(", {"encoding":"base64","preflightCommitment":"processed"}]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    auto result = root["result"];
+    if (result.isString()) return result.asString();
+    auto errMsg = root["error"]["message"].asString();
     throw std::runtime_error("sendTransaction failed: " +
-                             (err.empty() ? resp : err));
-  }
-  return sig;
+                             (errMsg.empty() ? resp : errMsg));
+}
+
+std::string RpcClient::simulateTransaction(const std::string &base64Tx,
+                                           bool replaceRecentBlockhash) {
+    std::string flag = replaceRecentBlockhash ? "true" : "false";
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"simulateTransaction","params":[")" +
+        base64Tx +
+        R"(", {"encoding":"base64","replaceRecentBlockhash":)" + flag +
+        R"(,"commitment":"processed"}]})";
+    return rpcPost(body);
 }
 
 uint64_t RpcClient::getBalance(const PublicKey &pubkey) {
-  std::string body =
-      R"({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[")" +
-      pubkey.toBase58() + R"("]})";
-  std::string resp = rpcPost(body);
-  return extractJsonNumber(resp, "value");
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[")" +
+        pubkey.toBase58() + R"(", {"commitment":"finalized"}]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    return root["result"]["value"].asUint();
 }
 
-std::string RpcClient::getAccountInfo(const PublicKey &pubkey) {
-  std::string body =
-      R"({"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[")" +
-      pubkey.toBase58() + R"(", {"encoding":"base64"}]})";
-  return rpcPost(body);
+AccountInfo RpcClient::getAccountInfo(const PublicKey &pubkey) {
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[")" +
+        pubkey.toBase58() +
+        R"(", {"encoding":"base64","commitment":"finalized"}]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    return parseAccountInfoNode(root["result"]["value"]);
+}
+
+std::vector<AccountInfo> RpcClient::getMultipleAccountsInfo(
+    const std::vector<PublicKey> &pubkeys)
+{
+    std::ostringstream keys;
+    keys << "[";
+    for (size_t i = 0; i < pubkeys.size(); ++i) {
+        if (i > 0) keys << ",";
+        keys << "\"" << pubkeys[i].toBase58() << "\"";
+    }
+    keys << "]";
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getMultipleAccounts","params":[)" +
+        keys.str() +
+        R"(, {"encoding":"base64","commitment":"finalized"}]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    auto valueArr = root["result"]["value"];
+    std::vector<AccountInfo> result;
+    if (!valueArr.isArray()) return result;
+    size_t n = valueArr.arraySize();
+    result.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        result.push_back(parseAccountInfoNode(valueArr[i]));
+    return result;
+}
+
+bool RpcClient::getAddressLookupTable(const PublicKey &altKey,
+                                      AddressLookupTableAccount &out) {
+    auto info = getAccountInfo(altKey);
+    if (!info.exists || info.data.empty()) return false;
+    return AddressLookupTableAccount::parse(altKey, info.data, out);
+}
+
+std::string RpcClient::getProgramAccounts(const PublicKey &programId,
+                                          const std::string &commitment) {
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts","params":[")" +
+        programId.toBase58() +
+        R"(", {"encoding":"base64","commitment":")" + commitment + R"("}]})";
+    return rpcPost(body);
 }
 
 std::string RpcClient::requestAirdrop(const PublicKey &pubkey,
                                       uint64_t lamports) {
-  std::string body =
-      R"({"jsonrpc":"2.0","id":1,"method":"requestAirdrop","params":[")" +
-      pubkey.toBase58() + R"(", )" + std::to_string(lamports) + R"(]})";
-  std::string resp = rpcPost(body);
-  std::string sig = extractJsonString(resp, "result");
-  if (sig.empty()) {
-    std::string err = extractJsonString(resp, "message");
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"requestAirdrop","params":[")" +
+        pubkey.toBase58() + R"(", )" + std::to_string(lamports) + R"(]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    auto result = root["result"];
+    if (result.isString()) return result.asString();
+    auto errMsg = root["error"]["message"].asString();
     throw std::runtime_error("requestAirdrop failed: " +
-                             (err.empty() ? resp : err));
-  }
-  return sig;
+                             (errMsg.empty() ? resp : errMsg));
 }
 
 bool RpcClient::confirmTransaction(const std::string &signature,
                                    uint32_t timeoutMs) {
-  auto start = std::chrono::steady_clock::now();
-  while (true) {
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::steady_clock::now() - start)
-                       .count();
-    if (elapsed >= timeoutMs)
-      return false;
-
-    try {
-      std::string resp = getSignatureStatuses({signature});
-      if (hasConfirmation(resp))
-        return true;
-    } catch (...) {
-      // Ignore transient errors, keep polling
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        if (static_cast<uint32_t>(elapsed) >= timeoutMs) return false;
+        try {
+            std::string resp = getSignatureStatuses({signature});
+            auto root = json::JsonValue::parse(resp);
+            auto status = root["result"]["value"][size_t(0)];
+            if (!status.isNull()) {
+                auto cs = status["confirmationStatus"].asString();
+                if (cs == "finalized" || cs == "confirmed" || cs == "processed")
+                    return true;
+            }
+        } catch (...) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
-
-    // Poll every 2 seconds
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-  }
 }
 
-std::string
-RpcClient::getSignatureStatuses(const std::vector<std::string> &signatures) {
-  std::ostringstream sigs;
-  sigs << "[";
-  for (size_t i = 0; i < signatures.size(); ++i) {
-    if (i > 0)
-      sigs << ",";
-    sigs << "\"" << signatures[i] << "\"";
-  }
-  sigs << "]";
-
-  std::string body =
-      R"({"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[)" +
-      sigs.str() + R"(, {"searchTransactionHistory":true}]})";
-  return rpcPost(body);
+std::string RpcClient::getSignatureStatuses(
+    const std::vector<std::string> &signatures)
+{
+    std::ostringstream sigs;
+    sigs << "[";
+    for (size_t i = 0; i < signatures.size(); ++i) {
+        if (i > 0) sigs << ",";
+        sigs << "\"" << signatures[i] << "\"";
+    }
+    sigs << "]";
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[)" +
+        sigs.str() + R"(, {"searchTransactionHistory":true}]})";
+    return rpcPost(body);
 }
 
 uint64_t RpcClient::getSlot() {
-  std::string body = R"({"jsonrpc":"2.0","id":1,"method":"getSlot"})";
-  std::string resp = rpcPost(body);
-  return extractJsonNumber(resp, "result");
+    std::string body =
+        R"({"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]})";
+    std::string resp = rpcPost(body);
+    auto root = json::JsonValue::parse(resp);
+    return root["result"].asUint();
 }
 
 } // namespace solana
