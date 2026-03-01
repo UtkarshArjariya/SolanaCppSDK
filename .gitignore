@@ -6,3 +6,6 @@ build/
 .DS_Store
 .vscode/
 cmake-build-*/
+
+# vcpkg is a local build tool — bootstrap it, don't commit it
+vcpkg/
